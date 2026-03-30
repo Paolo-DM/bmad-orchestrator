@@ -1,0 +1,17 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Runtime artifacts
+*.log
+*.bak
+/tmp/
+
+# Local config overrides (don't commit project-specific configs)
+bmad-loop.config.yaml
