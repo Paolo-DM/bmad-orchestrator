@@ -53,6 +53,8 @@ workflow:
 notifications:
   # Activity log path, relative to project.path
   log_file: "_bmad-output/implementation-artifacts/bmad-loop-activity.log"
+  # macOS desktop notifications via osascript (default: true on macOS, false elsewhere)
+  desktop: true
   # Future: webhook_url, slack_channel, telegram_bot_token, etc.
 
 cron:

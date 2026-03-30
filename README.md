@@ -105,12 +105,65 @@ bmad-loop-ctl.sh --config <config.yaml> <command>
   stop        Remove cron job and set state to stopped
   pause       Pause work (cron fires but skips — useful during manual debugging)
   resume      Resume after a pause
-  status      Show current state in a formatted summary
+  status      Show current state in a formatted summary (with elapsed time)
   skip        Skip the current story and advance to the next one
+  retry       Reset consecutive failures to 0 and set status to running
   logs        Tail the activity log (Ctrl-C to stop)
+  watch       Tail the current step's live output (falls back to activity log if idle)
+  progress    Show a formatted sprint progress view with story statuses
   run-once    Execute one cycle immediately (no cron required — good for testing)
   reset       Delete state file; next run will re-initialize from sprint-status.yaml
 ```
+
+### Live output tailing
+
+Each `claude -p` invocation is tee'd to a step-specific log file:
+
+```
+_bmad-output/implementation-artifacts/bmad-loop-steps/{story-num}/{step}-pass{N}-{timestamp}.log
+```
+
+This creates a full audit trail and lets you watch live progress:
+
+```bash
+# Watch the current step's output in real time
+./bmad-loop-ctl.sh --config /path/to/config.yaml watch
+
+# Or manually tail using the path shown in `status`
+tail -f _bmad-output/implementation-artifacts/bmad-loop-steps/2.3/code-review-pass1-20240115T102345Z.log
+```
+
+### Sprint progress view
+
+```bash
+./bmad-loop-ctl.sh --config /path/to/config.yaml progress
+```
+
+```
+=== BMAD Sprint Progress ===
+Project: 3d-print-flow
+
+Epic 2: [IN PROGRESS]
+  ✓ 2.1 figure catalog view empty state
+  ✓ 2.2 create edit figure with color assignment
+  ► 2.3 delete figure with cascade confirmation [code-review pass 1]
+  · 2.4 catalog to queue live binding
+
+Epic 3: [BACKLOG]
+  · 3.1 ...
+
+Progress: 2/6 stories (33%) | Current: 2.3 | Failures: 0
+```
+
+### Retry after stall
+
+When the loop hits `human-review-needed`, fix the underlying issue and retry without fully resetting:
+
+```bash
+./bmad-loop-ctl.sh --config /path/to/config.yaml retry
+```
+
+This resets `consecutiveFailures` to 0 and sets status back to `running`.
 
 ### Dry run
 
@@ -119,6 +172,8 @@ You can test what `bmad-loop.sh` would do without actually running `claude -p` o
 ```bash
 ./bmad-loop.sh --dry-run /path/to/bmad-loop.config.yaml
 ```
+
+In dry-run mode the full prompt, model, budget, and feature branch are printed.
 
 ---
 
@@ -168,6 +223,7 @@ workflow:
 
 notifications:
   log_file: "path/to/activity.log"      # Relative to project.path
+  desktop: true                          # macOS desktop notifications (default: true on macOS)
 
 cron:
   interval_minutes: 5
@@ -261,12 +317,15 @@ rm -rf /tmp/bmad-loop-*.lock
 ```
 
 **Loop stalled with `human-review-needed`**
-Check the activity log for the preceding `FAILURE` entries. Fix whatever the agent was struggling with, then:
+Check the activity log for the preceding `FAILURE` entries (or review the step output log shown in `status`). Fix whatever the agent was struggling with, then:
 ```bash
+# Retry the same story (resets failure count)
+bmad-loop-ctl.sh --config /path/to/config.yaml retry
+
+# Or resume (keeps failure count — safe after a pause)
 bmad-loop-ctl.sh --config /path/to/config.yaml resume
-```
-Or skip the problematic story:
-```bash
+
+# Or skip the problematic story entirely
 bmad-loop-ctl.sh --config /path/to/config.yaml skip
 ```
 
@@ -303,5 +362,6 @@ bmad-orchestrator/
 ```
 
 State is stored in `<project.path>/_bmad-output/implementation-artifacts/`:
-- `bmad-loop-state.json` — current orchestrator state (step, story, failures, etc.)
+- `bmad-loop-state.json` — current orchestrator state (step, story, failures, elapsed time, etc.)
 - `bmad-loop-activity.log` — append-only activity log
+- `bmad-loop-steps/{story-num}/{step}-pass{N}-{timestamp}.log` — per-step output logs for live tailing and audit
