@@ -1,0 +1,59 @@
+# BMAD Loop Orchestrator Configuration
+# Copy this file into your project root (or anywhere) and adjust for your project.
+# Pass it to the orchestrator: bmad-loop.sh /path/to/bmad-loop.config.yaml
+
+project:
+  name: "3d-print-flow"
+  path: "/Users/paolo/repos/personal/3d-print-flow"
+  # Path to sprint-status.yaml, relative to project.path
+  sprint_status: "_bmad-output/implementation-artifacts/sprint-status.yaml"
+  # Directory where story .md files live, relative to project.path
+  story_location: "_bmad-output/implementation-artifacts"
+
+branch_strategy:
+  base_branch: "develop"           # All feature branches are created from here
+  feature_branch_prefix: "feat/"   # e.g., feat/story-2.2
+  merge_after_review: true         # Auto-merge feature branch into base after code-review passes
+  push_after_merge: true           # Auto-push base branch to origin after merge
+
+models:
+  create_story: "opus"             # Use highest tier for story creation (expensive, runs once per story)
+  code_review: "opus"              # Use highest tier for adversarial review
+  dev_story_default: "sonnet"      # Default model for implementation work
+  epic_overrides:                  # Override model per epic (key = "epic-N")
+    epic-2: "sonnet"
+    epic-3: "opus"
+    epic-4: "sonnet"
+  story_overrides:                 # Per-story override, takes precedence over epic_overrides
+    2-4-catalog-to-queue-live-binding: "opus"
+
+budget:
+  create_story_max_usd: 2          # Max spend per create-story invocation
+  dev_story_max_usd: 5             # Max spend per dev-story invocation
+  code_review_max_usd: 3           # Max spend per code-review invocation
+
+timeouts:
+  create_story_seconds: 300        # 5 min
+  dev_story_seconds: 1800          # 30 min
+  code_review_seconds: 900         # 15 min
+
+workflow:
+  max_review_passes: 3             # How many code-review cycles before advancing regardless
+  max_consecutive_failures: 3      # Consecutive failures before pausing for human review
+  update_github_issues: true       # Close the GitHub issue after a story is marked done
+  # Optional extra instructions appended to dev-story prompts
+  extra_dev_instructions: |
+    Follow the vercel-react-best-practices skill patterns for all React components, hooks, and modules.
+    Use the shadcn MCP server when installing or configuring shadcn/ui components.
+  # Optional extra instructions appended to code-review prompts
+  extra_review_instructions: |
+    Also verify that all modified/created files follow the vercel-react-best-practices skill patterns.
+    Flag any violations as issues.
+
+notifications:
+  # Activity log path, relative to project.path
+  log_file: "_bmad-output/implementation-artifacts/bmad-loop-activity.log"
+  # Future: webhook_url, slack_channel, telegram_bot_token, etc.
+
+cron:
+  interval_minutes: 5              # How often the cron job fires

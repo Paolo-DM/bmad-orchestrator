@@ -15,3 +15,4 @@ Thumbs.db
 
 # Local config overrides (don't commit project-specific configs)
 bmad-loop.config.yaml
+!examples/bmad-loop.config.yaml
