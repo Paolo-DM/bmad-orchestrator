@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Ensure PATH includes common tool locations (cron uses a minimal PATH)
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:$HOME/.local/bin:$PATH"
+[ -s "$HOME/.nvm/nvm.sh" ] && source "$HOME/.nvm/nvm.sh" 2>/dev/null
+
 # bmad-loop.sh — BMAD V6 automated workflow orchestrator
 # Designed to be called by cron; runs ONE action per invocation.
 
