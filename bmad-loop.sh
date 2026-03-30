@@ -133,9 +133,49 @@ UPDATE_GITHUB=$(yq '.workflow.update_github_issues' "$CONFIG_FILE")
 EXTRA_DEV_INSTRUCTIONS=$(yq '.workflow.extra_dev_instructions' "$CONFIG_FILE")
 EXTRA_REVIEW_INSTRUCTIONS=$(yq '.workflow.extra_review_instructions' "$CONFIG_FILE")
 
+DESKTOP_NOTIFICATIONS=$(yq '.notifications.desktop // "auto"' "$CONFIG_FILE")
+if [[ "$DESKTOP_NOTIFICATIONS" == "auto" || "$DESKTOP_NOTIFICATIONS" == "null" ]]; then
+  $IS_MACOS && DESKTOP_NOTIFICATIONS="true" || DESKTOP_NOTIFICATIONS="false"
+fi
+
+STEP_LOG_BASE="${PROJECT_DIR}/_bmad-output/implementation-artifacts/bmad-loop-steps"
+
 # Ensure output dirs exist
 mkdir -p "$(dirname "$STATE_FILE")"
 mkdir -p "$(dirname "$LOG_FILE")"
+
+# ─── CONFIG VALIDATION ─────────────────────────────────────────────────────────
+_validate_config() {
+  local errors=0
+  local req_keys=(
+    "project.name" "project.path" "project.sprint_status" "project.story_location"
+    "notifications.log_file" "models.create_story" "models.code_review"
+    "models.dev_story_default" "branch_strategy.base_branch"
+    "branch_strategy.feature_branch_prefix" "workflow.max_review_passes"
+    "workflow.max_consecutive_failures" "cron.interval_minutes"
+  )
+  for k in "${req_keys[@]}"; do
+    local v
+    v=$(yq ".${k}" "$CONFIG_FILE")
+    if [[ -z "$v" || "$v" == "null" ]]; then
+      echo "ERROR: Config missing required key: $k" >&2
+      errors=$((errors + 1))
+    fi
+  done
+  if [[ ! -d "$PROJECT_DIR" ]]; then
+    echo "ERROR: project.path does not exist: $PROJECT_DIR" >&2
+    errors=$((errors + 1))
+  fi
+  if [[ -d "$PROJECT_DIR" && ! -f "$SPRINT_STATUS" ]]; then
+    echo "ERROR: sprint_status not found: $SPRINT_STATUS" >&2
+    errors=$((errors + 1))
+  fi
+  if [[ "$errors" -gt 0 ]]; then
+    echo "Config validation failed ($errors error(s)). Exiting." >&2
+    exit 1
+  fi
+}
+$DRY_RUN || _validate_config
 
 # ─── HELPERS ───────────────────────────────────────────────────────────────────
 
@@ -211,26 +251,42 @@ CLAUDE_OUTPUT=""
 CLAUDE_EXIT_CODE=0
 
 run_claude_p() {
-  local prompt="$1" model="$2" timeout_secs="$3" budget="$4"
+  local prompt="$1" model="$2" timeout_secs="$3" budget="$4" step_log="${5:-}"
   local output_file
   output_file=$(mktemp)
   CLAUDE_EXIT_CODE=0
 
   if $DRY_RUN; then
-    echo "[DRY-RUN] Would run claude -p with model=$model timeout=${timeout_secs}s budget=\$${budget}"
-    echo "[DRY-RUN] Prompt (first 200 chars): ${prompt:0:200}"
+    echo "[DRY-RUN] Model: $model | Timeout: ${timeout_secs}s | Budget: \$${budget}"
+    [[ -n "$step_log" ]] && echo "[DRY-RUN] Step log: $step_log"
+    echo "[DRY-RUN] Full prompt:"
+    echo "──────────────────────────────────────────────────────────"
+    echo "$prompt"
+    echo "──────────────────────────────────────────────────────────"
     CLAUDE_OUTPUT="[DRY-RUN output]"
     rm -f "$output_file"
     return
   fi
 
+  # Set up step log for live tailing
+  local log_dest="/dev/null"
+  if [[ -n "$step_log" ]]; then
+    mkdir -p "$(dirname "$step_log")"
+    log_dest="$step_log"
+    update_state "currentOutputLog" "$step_log"
+  fi
+  update_state "currentStepStartedAt" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
   cd "$PROJECT_DIR"
+  set +e
   run_with_timeout "$timeout_secs" claude -p "$prompt" \
     --model "$model" \
     --dangerously-skip-permissions \
     --max-budget-usd "$budget" \
     --output-format text \
-    > "$output_file" 2>&1 || CLAUDE_EXIT_CODE=$?
+    2>&1 | tee "$log_dest" > "$output_file"
+  CLAUDE_EXIT_CODE=${PIPESTATUS[0]}
+  set -e
 
   CLAUDE_OUTPUT=$(cat "$output_file")
   rm -f "$output_file"
@@ -307,7 +363,9 @@ advance_to_next_story() {
   "lastActionAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "lastExitCode": null,
   "totalStoriesCompleted": $new_total,
-  "currentStoryStartedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  "currentStoryStartedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "currentStepStartedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "currentOutputLog": null
 }
 STATEOF
     fi
@@ -321,6 +379,7 @@ STATEOF
       update_state "totalStoriesCompleted" "$new_total"
     fi
     log_activity "SPRINT_DONE" "All stories completed | total:$new_total"
+    notify_desktop "Sprint complete! All $new_total stories done." "Fanfare"
   fi
 }
 
@@ -338,6 +397,7 @@ complete_story() {
   fi
 
   log_activity "STORY_DONE" "story:$story_num | review_passes:$review_pass | reason:$reason"
+  notify_desktop "Story $story_num done! Moving to next story." "Glass"
 
   if [[ "$MERGE_AFTER_REVIEW" == "true" ]]; then
     do_merge_and_cleanup "$story_num" "$feature_branch"
@@ -365,7 +425,38 @@ handle_failure() {
   if [[ "$new_failures" -ge "$MAX_FAILURES" ]]; then
     $DRY_RUN || update_state "status" "human-review-needed"
     log_activity "STALL" "story:$story_num | action:paused-for-human-review"
+    notify_desktop "Human review needed: story $story_num failed $new_failures times." "Basso"
   fi
+}
+
+notify_desktop() {
+  local message="$1" sound="${2:-Glass}"
+  [[ "$DESKTOP_NOTIFICATIONS" != "true" ]] && return 0
+  $IS_MACOS || return 0
+  osascript -e "display notification \"${message}\" with title \"BMAD Loop\" sound name \"${sound}\"" 2>/dev/null || true
+}
+
+git_safety_check() {
+  local expected_branch="$1" step_name="$2"
+  $DRY_RUN && { echo "[DRY-RUN] Would verify branch=$expected_branch and clean working tree"; return 0; }
+  cd "$PROJECT_DIR"
+  local current_branch
+  current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+  if [[ "$current_branch" != "$expected_branch" ]]; then
+    log_activity "WARN" "story:$CURRENT_STORY_NUM | step:$step_name | wrong-branch:$current_branch | switching-to:$expected_branch"
+    git checkout "$expected_branch" 2>/dev/null || {
+      log_activity "ERROR" "story:$CURRENT_STORY_NUM | step:$step_name | branch-switch-failed:$expected_branch"
+      return 1
+    }
+  fi
+  if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
+    log_activity "WARN" "story:$CURRENT_STORY_NUM | step:$step_name | dirty-working-tree | auto-stashing"
+    git stash push -m "bmad-loop auto-stash before $step_name for story $CURRENT_STORY_NUM" 2>/dev/null || {
+      log_activity "ERROR" "story:$CURRENT_STORY_NUM | step:$step_name | stash-failed"
+      return 1
+    }
+  fi
+  return 0
 }
 
 # ─── INITIALIZE STATE FILE IF NEEDED ──────────────────────────────────────────
@@ -396,7 +487,9 @@ if [[ ! -f "$STATE_FILE" ]]; then
   "lastActionAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "lastExitCode": null,
   "totalStoriesCompleted": 0,
-  "currentStoryStartedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  "currentStoryStartedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "currentStepStartedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "currentOutputLog": null
 }
 INITEOF
   fi
@@ -461,13 +554,16 @@ case "$CURRENT_STEP" in
 
     log_activity "CRON_FIRE" "story:$CURRENT_STORY_NUM | step:create-story | model:$MODEL_CREATE"
 
+    STEP_LOG="${STEP_LOG_BASE}/${CURRENT_STORY_NUM}/create-story-pass1-$(date -u +%Y%m%dT%H%M%SZ).log"
+    $DRY_RUN && echo "[DRY-RUN] State: story=$CURRENT_STORY_NUM step=create-story model=$MODEL_CREATE budget=\$$BUDGET_CREATE"
+
     PROMPT="Run /bmad-create-story for story ${CURRENT_STORY}.
 When presented with interactive checkpoints like [a] [c] [p] [y], choose 'c' to continue.
 When asked yes/no questions, answer 'y'.
 Complete the entire workflow autonomously. Do not stop for user input.
 At the end, output the exact file path of the created story file on a line starting with BMAD_RESULT:CREATE_COMPLETE:"
 
-    run_claude_p "$PROMPT" "$MODEL_CREATE" "$TIMEOUT_CREATE" "$BUDGET_CREATE"
+    run_claude_p "$PROMPT" "$MODEL_CREATE" "$TIMEOUT_CREATE" "$BUDGET_CREATE" "$STEP_LOG"
 
     if [[ "$CLAUDE_EXIT_CODE" -eq 0 ]]; then
       STORY_FILE=$(find "$STORY_LOCATION" -name "${CURRENT_STORY}.md" -type f 2>/dev/null | head -1 || true)
@@ -478,6 +574,7 @@ At the end, output the exact file path of the created story file on a line start
           update_state "currentStoryFilePath" "$STORY_FILE"
           update_state "consecutiveFailures" "0"
           update_state "lastAction" "create-story-complete"
+          update_state "currentStepStartedAt" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
           # Ensure sprint-status reflects ready-for-dev
           STORY_STATUS=$(get_story_status "$CURRENT_STORY")
@@ -498,6 +595,8 @@ At the end, output the exact file path of the created story file on a line start
     log_activity "CRON_FIRE" "story:$CURRENT_STORY_NUM | step:dev-story | model:$DEV_MODEL"
 
     FEATURE_BRANCH="${FEATURE_PREFIX}story-${CURRENT_STORY_NUM}"
+    STEP_LOG="${STEP_LOG_BASE}/${CURRENT_STORY_NUM}/dev-story-pass1-$(date -u +%Y%m%dT%H%M%SZ).log"
+    $DRY_RUN && echo "[DRY-RUN] State: story=$CURRENT_STORY_NUM step=dev-story model=$DEV_MODEL budget=\$$BUDGET_DEV branch=$FEATURE_BRANCH"
 
     if ! $DRY_RUN; then
       cd "$PROJECT_DIR"
@@ -509,6 +608,11 @@ At the end, output the exact file path of the created story file on a line start
       else
         git checkout -b "$FEATURE_BRANCH"
       fi
+
+      git_safety_check "$FEATURE_BRANCH" "dev-story" || {
+        handle_failure "$CURRENT_STORY_NUM" "dev-story" "branch-safety-check-failed"
+        exit 0
+      }
     else
       echo "[DRY-RUN] Would checkout/create branch: $FEATURE_BRANCH"
     fi
@@ -531,7 +635,7 @@ feat: story ${CURRENT_STORY_NUM} — ${STORY_NAME_PRETTY}
 Then output: BMAD_RESULT:DEV_COMPLETE
 If tests fail after implementation, output: BMAD_RESULT:DEV_TESTS_FAILED:details"
 
-    run_claude_p "$PROMPT" "$DEV_MODEL" "$TIMEOUT_DEV" "$BUDGET_DEV"
+    run_claude_p "$PROMPT" "$DEV_MODEL" "$TIMEOUT_DEV" "$BUDGET_DEV" "$STEP_LOG"
 
     if echo "$CLAUDE_OUTPUT" | grep -q "BMAD_RESULT:HALT"; then
       HALT_REASON=$(echo "$CLAUDE_OUTPUT" | grep "BMAD_RESULT:HALT" | sed 's/.*BMAD_RESULT:HALT://' | head -1)
@@ -563,6 +667,7 @@ If tests fail after implementation, output: BMAD_RESULT:DEV_TESTS_FAILED:details
         update_state "reviewPassNumber" "1"
         update_state "consecutiveFailures" "0"
         update_state "lastAction" "dev-story-complete"
+        update_state "currentStepStartedAt" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
       }
       log_activity "TRANSITION" "story:$CURRENT_STORY_NUM | from:dev-story | to:code-review | model:$DEV_MODEL | ${NOTE:-}"
     else
@@ -572,7 +677,18 @@ If tests fail after implementation, output: BMAD_RESULT:DEV_TESTS_FAILED:details
 
   # ── CODE-REVIEW ─────────────────────────────────────────────────────────────
   "code-review")
+    FEATURE_BRANCH="${FEATURE_PREFIX}story-${CURRENT_STORY_NUM}"
     log_activity "CRON_FIRE" "story:$CURRENT_STORY_NUM | step:code-review | pass:${REVIEW_PASS}/${MAX_REVIEW_PASSES} | model:$MODEL_REVIEW"
+
+    STEP_LOG="${STEP_LOG_BASE}/${CURRENT_STORY_NUM}/code-review-pass${REVIEW_PASS}-$(date -u +%Y%m%dT%H%M%SZ).log"
+    $DRY_RUN && echo "[DRY-RUN] State: story=$CURRENT_STORY_NUM step=code-review pass=$REVIEW_PASS model=$MODEL_REVIEW budget=\$$BUDGET_REVIEW branch=$FEATURE_BRANCH"
+
+    if ! $DRY_RUN; then
+      git_safety_check "$FEATURE_BRANCH" "code-review" || {
+        handle_failure "$CURRENT_STORY_NUM" "code-review" "branch-safety-check-failed"
+        exit 0
+      }
+    fi
 
     STORY_NAME_PRETTY=$(get_story_name_pretty "$CURRENT_STORY")
 
@@ -595,7 +711,7 @@ Then output EXACTLY one of:
 BMAD_RESULT:REVIEW_CLEAN
 BMAD_RESULT:REVIEW_FIXED:count"
 
-    run_claude_p "$PROMPT" "$MODEL_REVIEW" "$TIMEOUT_REVIEW" "$BUDGET_REVIEW"
+    run_claude_p "$PROMPT" "$MODEL_REVIEW" "$TIMEOUT_REVIEW" "$BUDGET_REVIEW" "$STEP_LOG"
 
     if [[ "$CLAUDE_EXIT_CODE" -ne 0 ]]; then
       handle_failure "$CURRENT_STORY_NUM" "code-review" "claude-exit-${CLAUDE_EXIT_CODE}" "$CLAUDE_EXIT_CODE"

@@ -34,16 +34,20 @@ Commands:
   stop        Remove cron job and set state to stopped
   pause       Set state to paused (cron fires but skips all work)
   resume      Set state back to running
-  status      Show current state and progress
+  status      Show current state and progress (with elapsed time)
   skip        Skip current story and advance to the next one
+  retry       Reset consecutive failures and set status back to running
   logs        Tail the activity log (Ctrl-C to exit)
+  watch       Tail the current step's live output log (or activity log if idle)
+  progress    Show a formatted sprint progress view
   run-once    Execute one cycle immediately (useful for testing)
   reset       Remove state file so next run reinitializes from sprint-status.yaml
 
 Examples:
   bmad-loop-ctl.sh --config ~/projects/myapp/bmad-loop.config.yaml start
   bmad-loop-ctl.sh --config ~/projects/myapp/bmad-loop.config.yaml status
-  bmad-loop-ctl.sh --config ~/projects/myapp/bmad-loop.config.yaml logs
+  bmad-loop-ctl.sh --config ~/projects/myapp/bmad-loop.config.yaml watch
+  bmad-loop-ctl.sh --config ~/projects/myapp/bmad-loop.config.yaml progress
 EOF
 }
 
@@ -89,6 +93,21 @@ PROJECT_NAME=$(yq '.project.name' "$CONFIG_FILE")
 
 # Unique cron identifier based on config path hash
 CRON_HASH=$(config_hash "$CONFIG_FILE" | head -c 8)
+
+# ─── HELPERS ───────────────────────────────────────────────────────────────────
+elapsed_since() {
+  local ts="$1"
+  [[ -z "$ts" || "$ts" == "null" ]] && echo "unknown" && return
+  local start_epoch now_epoch elapsed
+  if $IS_MACOS; then
+    start_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$ts" "+%s" 2>/dev/null) || { echo "unknown"; return; }
+  else
+    start_epoch=$(date -d "$ts" "+%s" 2>/dev/null) || { echo "unknown"; return; }
+  fi
+  now_epoch=$(date "+%s")
+  elapsed=$(( now_epoch - start_epoch ))
+  printf "%dm%ds" $(( elapsed / 60 )) $(( elapsed % 60 ))
+}
 
 # ─── COMMAND DISPATCH ──────────────────────────────────────────────────────────
 case "$COMMAND" in
@@ -187,7 +206,12 @@ case "$COMMAND" in
     st_last_action=$(jq -r '.lastAction'        "$STATE_FILE")
     st_last_at=$(jq -r '.lastActionAt'          "$STATE_FILE")
     st_started=$(jq -r '.currentStoryStartedAt' "$STATE_FILE")
+    st_step_started=$(jq -r '.currentStepStartedAt // ""' "$STATE_FILE")
+    st_output_log=$(jq -r '.currentOutputLog // ""' "$STATE_FILE")
     st_file=$(jq -r '.currentStoryFilePath'     "$STATE_FILE")
+
+    story_elapsed=$(elapsed_since "$st_started")
+    step_elapsed=$(elapsed_since "$st_step_started")
 
     # Determine status color indicator
     case "$st_status" in
@@ -202,22 +226,25 @@ case "$COMMAND" in
     echo "╔══════════════════════════════════════════════════════════╗"
     echo "║  BMAD Loop Status — $PROJECT_NAME"
     echo "╠══════════════════════════════════════════════════════════╣"
-    printf "║  Status:     %s %s\n" "$indicator" "$st_status"
-    printf "║  Story:      %s (%s)\n" "$st_story" "$st_story_key"
-    printf "║  Step:       %s\n" "$st_step"
-    printf "║  Review:     pass %s/%s\n" "$st_rev" "$max_review"
-    printf "║  Failures:   %s/%s consecutive\n" "$st_failures" "$max_failures"
-    printf "║  Completed:  %s stories this sprint\n" "$st_total"
-    printf "║  Story file: %s\n" "$st_file"
-    printf "║  Started:    %s\n" "$st_started"
-    printf "║  Last:       %s\n" "$st_last_action"
-    printf "║  Last at:    %s\n" "$st_last_at"
+    printf "║  Status:      %s %s\n" "$indicator" "$st_status"
+    printf "║  Story:       %s (%s)\n" "$st_story" "$st_story_key"
+    printf "║  Step:        %s  [%s elapsed]\n" "$st_step" "$step_elapsed"
+    printf "║  Review:      pass %s/%s\n" "$st_rev" "$max_review"
+    printf "║  Failures:    %s/%s consecutive\n" "$st_failures" "$max_failures"
+    printf "║  Completed:   %s stories this sprint\n" "$st_total"
+    printf "║  Story time:  %s elapsed\n" "$story_elapsed"
+    printf "║  Story file:  %s\n" "$st_file"
+    printf "║  Last:        %s\n" "$st_last_action"
+    printf "║  Last at:     %s\n" "$st_last_at"
+    if [[ -n "$st_output_log" && "$st_output_log" != "null" ]]; then
+      printf "║  Live log:    %s\n" "$st_output_log"
+    fi
     echo "╠══════════════════════════════════════════════════════════╣"
     cron_line=$(crontab -l 2>/dev/null | grep "bmad-loop:$CRON_HASH" || true)
     if [[ -n "$cron_line" ]]; then
-      echo "║  Cron:       INSTALLED (every $CRON_INTERVAL min)"
+      echo "║  Cron:        INSTALLED (every $CRON_INTERVAL min)"
     else
-      echo "║  Cron:       NOT INSTALLED (run 'start' to install)"
+      echo "║  Cron:        NOT INSTALLED (run 'start' to install)"
     fi
     echo "╚══════════════════════════════════════════════════════════╝"
     ;;
@@ -277,7 +304,9 @@ case "$COMMAND" in
   "lastActionAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "lastExitCode": null,
   "totalStoriesCompleted": $total_completed,
-  "currentStoryStartedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  "currentStoryStartedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "currentStepStartedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "currentOutputLog": null
 }
 SKIPEOF
 
@@ -326,6 +355,129 @@ SKIPEOF
     else
       echo "No state file found — nothing to reset."
     fi
+    ;;
+
+  # ── WATCH ────────────────────────────────────────────────────────────────────
+  watch)
+    current_log=""
+    if [[ -f "$STATE_FILE" ]]; then
+      current_log=$(jq -r '.currentOutputLog // ""' "$STATE_FILE")
+    fi
+
+    if [[ -n "$current_log" && "$current_log" != "null" && -f "$current_log" ]]; then
+      echo "Watching step output: $current_log"
+      echo "──────────────────────────────────────────────────────────"
+      tail -f "$current_log"
+    elif [[ -f "$LOG_FILE" ]]; then
+      echo "No step currently running. Showing activity log: $LOG_FILE"
+      echo "──────────────────────────────────────────────────────────"
+      tail -f "$LOG_FILE"
+    else
+      echo "Nothing to watch — no step running and no activity log found."
+      exit 0
+    fi
+    ;;
+
+  # ── PROGRESS ─────────────────────────────────────────────────────────────────
+  progress)
+    sprint_status_rel=$(yq '.project.sprint_status' "$CONFIG_FILE")
+    sprint_status="${PROJECT_DIR}/${sprint_status_rel}"
+
+    if [[ ! -f "$sprint_status" ]]; then
+      echo "Sprint status file not found: $sprint_status" >&2; exit 1
+    fi
+
+    # Read current state
+    current_story="" current_step="" current_story_num="" review_pass=1 failures=0 total_completed=0
+    if [[ -f "$STATE_FILE" ]]; then
+      current_story=$(jq -r '.currentStory // ""' "$STATE_FILE")
+      current_step=$(jq -r '.currentStep // ""' "$STATE_FILE")
+      current_story_num=$(jq -r '.currentStoryNumber // ""' "$STATE_FILE")
+      review_pass=$(jq -r '.reviewPassNumber // 1' "$STATE_FILE")
+      failures=$(jq -r '.consecutiveFailures // 0' "$STATE_FILE")
+      total_completed=$(jq -r '.totalStoriesCompleted // 0' "$STATE_FILE")
+    fi
+
+    echo "=== BMAD Sprint Progress ==="
+    echo "Project: $PROJECT_NAME"
+    echo ""
+
+    prev_epic=""
+    total_stories=0
+    done_stories=0
+
+    while IFS='|' read -r key status; do
+      key=$(echo "$key" | tr -d '"' | tr -d ' ')
+      status=$(echo "$status" | tr -d '"' | tr -d ' ')
+      [[ -z "$key" ]] && continue
+      # Skip epic-level entries
+      [[ "$key" =~ ^epic- ]] && continue
+      # Only process story entries (must start with digit-digit)
+      [[ "$key" =~ ^[0-9]+-[0-9]+ ]] || continue
+
+      epic_num=$(echo "$key" | sed 's/^\([0-9]*\)-.*/\1/')
+      story_part=$(echo "$key" | sed 's/^[0-9]*-\([0-9]*\)-.*/\1/')
+      story_num="${epic_num}.${story_part}"
+      story_name=$(echo "$key" | sed 's/^[0-9]*-[0-9]*-//' | tr '-' ' ')
+
+      total_stories=$((total_stories + 1))
+      [[ "$status" == "done" ]] && done_stories=$((done_stories + 1))
+
+      # Print epic header when epic changes
+      if [[ "$epic_num" != "$prev_epic" ]]; then
+        [[ -n "$prev_epic" ]] && echo ""
+        epic_status=$(yq ".development_status.\"epic-${epic_num}\" // \"backlog\"" "$sprint_status" 2>/dev/null || echo "backlog")
+        case "$epic_status" in
+          done)        epic_label="DONE" ;;
+          in-progress) epic_label="IN PROGRESS" ;;
+          *)           epic_label="BACKLOG" ;;
+        esac
+        echo "Epic ${epic_num}: [${epic_label}]"
+        prev_epic="$epic_num"
+      fi
+
+      # Story symbol
+      if [[ "$status" == "done" ]]; then
+        symbol="✓"
+      elif [[ "$key" == "$current_story" ]]; then
+        symbol="►"
+      else
+        symbol="·"
+      fi
+
+      # Current story annotation
+      suffix=""
+      if [[ "$key" == "$current_story" ]]; then
+        case "$current_step" in
+          create-story) suffix=" [creating story]" ;;
+          dev-story)    suffix=" [implementing]" ;;
+          code-review)  suffix=" [code-review pass ${review_pass}]" ;;
+          *)            suffix=" [$current_step]" ;;
+        esac
+      fi
+
+      printf "  %s %s %s%s\n" "$symbol" "$story_num" "$story_name" "$suffix"
+    done < <(yq '.development_status | to_entries[] | .key + "|" + .value' "$sprint_status")
+
+    echo ""
+    pct=0
+    [[ "$total_stories" -gt 0 ]] && pct=$(( done_stories * 100 / total_stories ))
+    printf "Progress: %d/%d stories (%d%%) | Current: %s | Failures: %d\n" \
+      "$done_stories" "$total_stories" "$pct" "${current_story_num:-none}" "$failures"
+    ;;
+
+  # ── RETRY ────────────────────────────────────────────────────────────────────
+  retry)
+    if [[ ! -f "$STATE_FILE" ]]; then
+      echo "No state file found." >&2; exit 1
+    fi
+    prev_status=$(jq -r '.status' "$STATE_FILE")
+    tmp=$(mktemp)
+    jq '.status = "running" | .consecutiveFailures = 0 | .lastAction = "manually-retried" | .lastActionAt = "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"' \
+      "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+    echo "Retrying: reset consecutive failures to 0, status set to running."
+    echo "Previous status was: $prev_status"
+    echo "Run 'run-once' to execute immediately, or wait for next cron fire."
     ;;
 
   *)
